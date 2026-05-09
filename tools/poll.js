@@ -58,20 +58,31 @@ async function processTable(t) {
   let errorMsg = null;
 
   try {
-    // 2. Heartbeat: capture freshness state
+    // 2. Heartbeat: capture freshness state.
+    // Single INSERT...SELECT computes everything server-side — no JS-side
+    // timezone round-trip on TIMESTAMP_NTZ values. staleness_sec is computed
+    // by casting both sides to UTC explicitly to avoid implicit NTZ/LTZ skew.
     const cdcCounts = t.hasCdcStatus
-      ? `COUNT_IF(CDCSTATUS='I') AS i, COUNT_IF(CDCSTATUS='U') AS u, COUNT_IF(CDCSTATUS='D') AS d`
-      : `NULL::NUMBER AS i, NULL::NUMBER AS u, NULL::NUMBER AS d`;
-    const hbRow = (await q(`
-      SELECT MAX(${t.tsCol}) AS max_ts, COUNT(*) AS n, ${cdcCounts}
-      FROM ${t.view}
-    `))[0];
+      ? `COUNT_IF(CDCSTATUS='I'), COUNT_IF(CDCSTATUS='U'), COUNT_IF(CDCSTATUS='D')`
+      : `NULL::NUMBER, NULL::NUMBER, NULL::NUMBER`;
     await q(`
-      INSERT INTO HEARTBEAT_LOG (target_table, source_ts_column, max_source_ts, row_count, cdc_i_count, cdc_u_count, cdc_d_count, staleness_sec)
-      SELECT '${t.name}', '${t.tsCol}', '${hbRow.MAX_TS.toISOString()}'::TIMESTAMP_NTZ, ${hbRow.N},
-             ${hbRow.I ?? 'NULL'}, ${hbRow.U ?? 'NULL'}, ${hbRow.D ?? 'NULL'},
-             TIMESTAMPDIFF('SECOND', '${hbRow.MAX_TS.toISOString()}'::TIMESTAMP_NTZ, CURRENT_TIMESTAMP())
+      INSERT INTO HEARTBEAT_LOG (target_table, source_ts_column, max_source_ts, row_count, cdc_i_count, cdc_u_count, cdc_d_count, observed_at, staleness_sec)
+      SELECT '${t.name}',
+             '${t.tsCol}',
+             MAX(${t.tsCol}),
+             COUNT(*),
+             ${cdcCounts},
+             CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
+             TIMESTAMPDIFF('SECOND',
+               CONVERT_TIMEZONE('UTC', MAX(${t.tsCol})::TIMESTAMP_LTZ),
+               CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP()))
+      FROM ${t.view}
     `);
+    // Read the just-inserted row so the rest of the function can use max_source_ts
+    const hbRow = (await q(`
+      SELECT max_source_ts AS MAX_TS FROM HEARTBEAT_LOG
+      WHERE target_table='${t.name}' ORDER BY observed_at DESC LIMIT 1
+    `))[0];
 
     // 3. Get prior watermark for the windowing predicate.
     const wmRow = (await q(`
@@ -245,6 +256,10 @@ async function main() {
   await q(`USE ROLE LAG_OBSERVER_ROLE`);
   await q(`USE WAREHOUSE LAG_OBS_WH`);
   await q(`USE SCHEMA PRO_OBSERVABILITY.LAG_OBS`);
+  // Force session TZ to UTC so all NTZ comparisons are unambiguous. Avionte
+  // appears to write share NTZ columns in UTC raw; Snowflake's default LA
+  // session TZ caused -4h staleness skew before this. (v0.1.1 fix.)
+  await q(`ALTER SESSION SET TIMEZONE = 'UTC'`);
 
   const tStart = Date.now();
   const results = [];

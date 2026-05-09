@@ -9,13 +9,16 @@ USE WAREHOUSE LAG_OBS_WH;
 -- =============================================================
 -- CURRENT_FRESHNESS — most recent heartbeat per table
 -- =============================================================
+-- All stored NTZ values are written with session TIMEZONE='UTC' (see poll.js)
+-- so direct DATEDIFF on NTZ is unambiguous. Don't cast to LTZ — that re-applies
+-- the querying session's TZ and breaks staleness for users in non-UTC sessions.
 CREATE OR REPLACE VIEW CURRENT_FRESHNESS AS
 SELECT
   target_table,
   source_ts_column,
   max_source_ts,
   observed_at,
-  staleness_sec,
+  DATEDIFF('SECOND', max_source_ts, observed_at) AS staleness_sec,
   row_count,
   cdc_i_count, cdc_u_count, cdc_d_count
 FROM HEARTBEAT_LOG

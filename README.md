@@ -84,8 +84,10 @@ node tools/poll.js --snapshot-diff  # silent-delete sweep on APPLICANT_TAGS + AP
 ### Schedule (Windows Task Scheduler)
 
 Two registered tasks on Claudia (PRO-DYR58J4WA):
-- `LagObserver-Poll` — runs `tools/poll-wrapper.ps1` every 1 minute
-- `LagObserver-SnapshotDiff` — runs `tools/poll-wrapper.ps1 snapshot-diff` every 5 minutes
+- `LagObserver-Poll` — fires `tools/poll-launcher.vbs` every 1 minute
+- `LagObserver-SnapshotDiff` — fires `tools/poll-launcher.vbs snapshot-diff` every 5 minutes
+
+Both use `wscript.exe` to invoke a `.vbs` shim that launches `poll-wrapper.ps1` with `windowStyle=0` (hidden). This prevents the console-window flash that Task Scheduler's direct `powershell.exe` invocation always causes — important on a workstation Brent uses interactively.
 
 Logs land in `logs/poll-YYYYMMDD.log`.
 

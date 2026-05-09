@@ -1,0 +1,271 @@
+#!/usr/bin/env node
+// lag-observer polling runner — single cycle.
+// Runs heartbeat + insert/update/delete detection for all 5 target tables,
+// writes to HEARTBEAT_LOG, CHANGE_LOG, SEEN_PKS, WATERMARK_STATE, RUN_LOG.
+//
+// Designed to be invoked by Windows Task Scheduler every minute.
+//
+// Usage: node poll.js
+//        node poll.js --snapshot-diff   (run periodic delete-detection sweep)
+
+const fs = require('fs');
+const snowflake = require('snowflake-sdk');
+snowflake.configure({ ocspFailOpen: true });
+
+const SNAPSHOT_DIFF = process.argv.includes('--snapshot-diff');
+
+const conn = snowflake.createConnection({
+  account: process.env.SNOWFLAKE_ACCOUNT,
+  username: process.env.SNOWFLAKE_ADMIN_USER,
+  authenticator: 'SNOWFLAKE_JWT',
+  privateKey: fs.readFileSync(process.env.SNOWFLAKE_ADMIN_PRIVATE_KEY_PATH, 'utf8'),
+  warehouse: 'LAG_OBS_WH',
+  clientSessionKeepAlive: true,
+});
+
+const q = (sql) => new Promise((res, rej) =>
+  conn.execute({ sqlText: sql, complete: (err, _, rows) => err ? rej(err) : res(rows || []) })
+);
+
+// Per-table config. ACTIVITY_FACT has no CDCSTATUS and uses ACTDATETIME as
+// watermark instead of LASTUPDATEDDATE.
+const TABLES = [
+  { name: 'REQ_HIRED',      pk: 'REQHIREDID', tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.REQ_HIRED'      },
+  { name: 'APP_NOMINATE',   pk: 'NOMID',      tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_NOMINATE'   },
+  { name: 'APPLICANT_TAGS', pk: 'TAGID',      tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APPLICANT_TAGS' },
+  { name: 'APP_SKILLS',     pk: 'SKILLID',    tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_SKILLS'     },
+  { name: 'ACTIVITY_FACT',  pk: 'ACTIVITYKEY',tsCol: 'ACTDATETIME',     hasCdcStatus: false, view: 'PROD_ANALYTICS_PRO.DATALINK.ACTIVITY_FACT'  },
+];
+
+async function processTable(t) {
+  // 1. Open RUN_LOG entry
+  const runIdRow = await q(`
+    INSERT INTO RUN_LOG (target_table, task_kind, status)
+    VALUES ('${t.name}', 'heartbeat_and_changes', 'RUNNING')
+  `);
+  // We don't get the auto-gen run_id back from INSERT; query the most recent
+  // RUNNING row for this table instead.
+  const runIdQ = await q(`
+    SELECT run_id, started_at FROM RUN_LOG
+    WHERE target_table='${t.name}' AND status='RUNNING'
+    ORDER BY started_at DESC LIMIT 1
+  `);
+  const runId = runIdQ[0].RUN_ID;
+  const startedAt = runIdQ[0].STARTED_AT;
+
+  let totalInserted = 0;
+  let possibleMissedWindow = false;
+  let errorMsg = null;
+
+  try {
+    // 2. Heartbeat: capture freshness state
+    const cdcCounts = t.hasCdcStatus
+      ? `COUNT_IF(CDCSTATUS='I') AS i, COUNT_IF(CDCSTATUS='U') AS u, COUNT_IF(CDCSTATUS='D') AS d`
+      : `NULL::NUMBER AS i, NULL::NUMBER AS u, NULL::NUMBER AS d`;
+    const hbRow = (await q(`
+      SELECT MAX(${t.tsCol}) AS max_ts, COUNT(*) AS n, ${cdcCounts}
+      FROM ${t.view}
+    `))[0];
+    await q(`
+      INSERT INTO HEARTBEAT_LOG (target_table, source_ts_column, max_source_ts, row_count, cdc_i_count, cdc_u_count, cdc_d_count, staleness_sec)
+      SELECT '${t.name}', '${t.tsCol}', '${hbRow.MAX_TS.toISOString()}'::TIMESTAMP_NTZ, ${hbRow.N},
+             ${hbRow.I ?? 'NULL'}, ${hbRow.U ?? 'NULL'}, ${hbRow.D ?? 'NULL'},
+             TIMESTAMPDIFF('SECOND', '${hbRow.MAX_TS.toISOString()}'::TIMESTAMP_NTZ, CURRENT_TIMESTAMP())
+    `);
+
+    // 3. Get prior watermark for the windowing predicate.
+    const wmRow = (await q(`
+      SELECT last_seen_at FROM WATERMARK_STATE
+      WHERE target_table='${t.name}' AND watermark_column='${t.tsCol}'
+    `))[0];
+    const priorWatermark = wmRow ? wmRow.LAST_SEEN_AT : null;
+
+    // Missed-window check: if the new max_source_ts jumped by more than 2x the
+    // typical interval since last poll, flag it. Conservative — for now, if
+    // the gap exceeds 10 minutes we mark it.
+    if (priorWatermark && hbRow.MAX_TS) {
+      const gapSec = (new Date(hbRow.MAX_TS) - new Date(priorWatermark)) / 1000;
+      if (gapSec > 600) possibleMissedWindow = true;
+    }
+
+    // 4. Insert detection (PKs not in SEEN_PKS, in the recent window)
+    // For ACTIVITY_FACT, recent window = last 24h on ACTDATETIME.
+    // For others, recent window = LASTUPDATEDDATE > prior_watermark - 60s buffer.
+    let recentClause;
+    if (t.name === 'ACTIVITY_FACT') {
+      recentClause = `${t.tsCol} > DATEADD('HOUR', -24, CURRENT_TIMESTAMP())`;
+    } else {
+      // Use prior watermark with 60s overlap buffer to handle precision/clock skew
+      const priorClause = priorWatermark
+        ? `DATEADD('SECOND', -60, '${new Date(priorWatermark).toISOString()}'::TIMESTAMP_NTZ)`
+        : `'2000-01-01'::TIMESTAMP_NTZ`;
+      recentClause = `${t.tsCol} > ${priorClause}`;
+    }
+
+    const insertCount = await q(`
+      INSERT INTO CHANGE_LOG (target_table, change_type, row_pk, source_lastupdateddate, cdcstatus_observed, observation_latency_sec)
+      SELECT '${t.name}', 'I', t.${t.pk}::VARCHAR,
+             ${t.hasCdcStatus ? 't.LASTUPDATEDDATE' : 't.ACTDATETIME::TIMESTAMP_NTZ'},
+             ${t.hasCdcStatus ? 't.CDCSTATUS' : "'I'"},
+             TIMESTAMPDIFF('SECOND', ${t.hasCdcStatus ? 't.LASTUPDATEDDATE' : 't.ACTDATETIME'}, CURRENT_TIMESTAMP())
+      FROM ${t.view} t
+      WHERE ${recentClause}
+        AND t.${t.pk}::VARCHAR NOT IN (
+          SELECT pk_value FROM SEEN_PKS WHERE target_table='${t.name}'
+        )
+    `);
+    const insertedI = insertCount[0]['number of rows inserted'] || 0;
+    totalInserted += insertedI;
+
+    // Mirror new PKs into SEEN_PKS so they don't re-fire next tick
+    if (insertedI > 0) {
+      await q(`
+        INSERT INTO SEEN_PKS (target_table, pk_value)
+        SELECT '${t.name}', t.${t.pk}::VARCHAR
+        FROM ${t.view} t
+        WHERE ${recentClause}
+          AND t.${t.pk}::VARCHAR NOT IN (
+            SELECT pk_value FROM SEEN_PKS WHERE target_table='${t.name}'
+          )
+      `);
+    }
+
+    // 5. Update detection (CDCSTATUS='U' rows we haven't logged yet for the current LASTUPDATEDDATE)
+    if (t.hasCdcStatus) {
+      const upCount = await q(`
+        INSERT INTO CHANGE_LOG (target_table, change_type, row_pk, source_lastupdateddate, cdcstatus_observed, observation_latency_sec)
+        SELECT '${t.name}', 'U', t.${t.pk}::VARCHAR, t.LASTUPDATEDDATE, t.CDCSTATUS,
+               TIMESTAMPDIFF('SECOND', t.LASTUPDATEDDATE, CURRENT_TIMESTAMP())
+        FROM ${t.view} t
+        WHERE t.CDCSTATUS = 'U'
+          AND NOT EXISTS (
+            SELECT 1 FROM CHANGE_LOG c
+            WHERE c.target_table='${t.name}'
+              AND c.row_pk = t.${t.pk}::VARCHAR
+              AND c.change_type = 'U'
+              AND c.source_lastupdateddate = t.LASTUPDATEDDATE
+          )
+      `);
+      totalInserted += upCount[0]['number of rows inserted'] || 0;
+    }
+
+    // 6. Delete detection (CDCSTATUS='D' for APP_SKILLS)
+    if (t.name === 'APP_SKILLS') {
+      const dCount = await q(`
+        INSERT INTO CHANGE_LOG (target_table, change_type, row_pk, source_lastupdateddate, cdcstatus_observed, observation_latency_sec)
+        SELECT 'APP_SKILLS', 'D', t.SKILLID::VARCHAR, t.LASTUPDATEDDATE, t.CDCSTATUS,
+               TIMESTAMPDIFF('SECOND', t.LASTUPDATEDDATE, CURRENT_TIMESTAMP())
+        FROM PROD_ANALYTICS_PRO.DATALINK.APP_SKILLS t
+        WHERE t.CDCSTATUS = 'D'
+          AND NOT EXISTS (
+            SELECT 1 FROM CHANGE_LOG c
+            WHERE c.target_table='APP_SKILLS'
+              AND c.row_pk = t.SKILLID::VARCHAR
+              AND c.change_type='D'
+              AND c.source_lastupdateddate = t.LASTUPDATEDDATE
+          )
+      `);
+      totalInserted += dCount[0]['number of rows inserted'] || 0;
+    }
+
+    // 7. Advance the watermark
+    await q(`
+      UPDATE WATERMARK_STATE
+      SET last_seen_at = '${hbRow.MAX_TS.toISOString()}'::TIMESTAMP_NTZ,
+          updated_at = CURRENT_TIMESTAMP()
+      WHERE target_table='${t.name}' AND watermark_column='${t.tsCol}'
+    `);
+  } catch (e) {
+    errorMsg = e.message.replace(/'/g, "''").slice(0, 500);
+  }
+
+  // 8. Close RUN_LOG entry
+  await q(`
+    UPDATE RUN_LOG
+    SET finished_at = CURRENT_TIMESTAMP(),
+        status = '${errorMsg ? 'ERROR' : 'OK'}',
+        error_msg = ${errorMsg ? `'${errorMsg}'` : 'NULL'},
+        rows_inserted_to_changelog = ${totalInserted},
+        possible_missed_window = ${possibleMissedWindow}
+    WHERE run_id = '${runId}'
+  `);
+
+  return { table: t.name, inserted: totalInserted, error: errorMsg, missedWindow: possibleMissedWindow };
+}
+
+async function snapshotDiff() {
+  const results = [];
+
+  // APPLICANT_TAGS — silent deletes via TAGID set diff
+  for (const [t, pkCol, snapTable] of [
+    ['APPLICANT_TAGS', 'TAGID',   'PK_SNAPSHOT_APPLICANT_TAGS'],
+    ['APP_SKILLS',     'SKILLID', 'PK_SNAPSHOT_APP_SKILLS'],
+  ]) {
+    await q(`INSERT INTO RUN_LOG (target_table, task_kind, status) VALUES ('${t}', 'snapshot_diff', 'RUNNING')`);
+    const runIdQ = await q(`SELECT run_id FROM RUN_LOG WHERE target_table='${t}' AND task_kind='snapshot_diff' AND status='RUNNING' ORDER BY started_at DESC LIMIT 1`);
+    const runId = runIdQ[0].RUN_ID;
+    let inserted = 0;
+    let errorMsg = null;
+    try {
+      // Find PKs that were in the old snapshot but aren't in the share now → silent deletes
+      const dCount = await q(`
+        INSERT INTO CHANGE_LOG (target_table, change_type, row_pk, source_lastupdateddate, cdcstatus_observed, observation_latency_sec)
+        SELECT '${t}', 'D', s.${pkCol.toLowerCase()}::VARCHAR, NULL, 'silent-disappear', NULL
+        FROM ${snapTable} s
+        WHERE NOT EXISTS (
+          SELECT 1 FROM PROD_ANALYTICS_PRO.DATALINK.${t} v WHERE v.${pkCol} = s.${pkCol.toLowerCase()}
+        )
+        AND s.${pkCol.toLowerCase()}::VARCHAR NOT IN (
+          SELECT row_pk FROM CHANGE_LOG WHERE target_table='${t}' AND change_type='D' AND cdcstatus_observed='silent-disappear'
+        )
+      `);
+      inserted = dCount[0]['number of rows inserted'] || 0;
+
+      // Replace snapshot with current state
+      await q(`TRUNCATE TABLE ${snapTable}`);
+      await q(`INSERT INTO ${snapTable} (${pkCol.toLowerCase()}) SELECT ${pkCol} FROM PROD_ANALYTICS_PRO.DATALINK.${t}`);
+    } catch (e) {
+      errorMsg = e.message.replace(/'/g, "''").slice(0, 500);
+    }
+    await q(`
+      UPDATE RUN_LOG
+      SET finished_at = CURRENT_TIMESTAMP(),
+          status = '${errorMsg ? 'ERROR' : 'OK'}',
+          error_msg = ${errorMsg ? `'${errorMsg}'` : 'NULL'},
+          rows_inserted_to_changelog = ${inserted}
+      WHERE run_id = '${runId}'
+    `);
+    results.push({ table: t, kind: 'snapshot_diff', inserted, error: errorMsg });
+  }
+  return results;
+}
+
+async function main() {
+  await new Promise((res, rej) => conn.connect(err => err ? rej(err) : res()));
+  await q(`USE ROLE LAG_OBSERVER_ROLE`);
+  await q(`USE WAREHOUSE LAG_OBS_WH`);
+  await q(`USE SCHEMA PRO_OBSERVABILITY.LAG_OBS`);
+
+  const tStart = Date.now();
+  const results = [];
+
+  if (SNAPSHOT_DIFF) {
+    const r = await snapshotDiff();
+    results.push(...r);
+  } else {
+    for (const t of TABLES) {
+      const r = await processTable(t);
+      results.push(r);
+    }
+  }
+
+  const elapsed = Math.round((Date.now() - tStart) / 1000 * 100) / 100;
+  console.log(`Cycle complete in ${elapsed}s`);
+  for (const r of results) {
+    console.log(`  ${r.table}${r.kind ? ' (' + r.kind + ')' : ''}: inserted=${r.inserted}${r.missedWindow ? ' [MISSED-WINDOW]' : ''}${r.error ? ' ERROR: ' + r.error : ''}`);
+  }
+
+  conn.destroy(() => {});
+}
+
+main().catch(err => { console.error('FAIL:', err.message); process.exit(1); });

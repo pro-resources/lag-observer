@@ -29,12 +29,19 @@ const q = (sql) => new Promise((res, rej) =>
 
 // Per-table config. ACTIVITY_FACT has no CDCSTATUS and uses ACTDATETIME as
 // watermark instead of LASTUPDATEDDATE.
+//
+// Expansion 2026-05-11: added APPLICANTS, APP_DOC_UPLOAD, APP_JOB_HISTORY.
+// All three follow the standard CDCSTATUS + LASTUPDATEDDATE pattern.
+// PKs validated against current share state (100% unique, 0 nulls).
 const TABLES = [
-  { name: 'REQ_HIRED',      pk: 'REQHIREDID', tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.REQ_HIRED'      },
-  { name: 'APP_NOMINATE',   pk: 'NOMID',      tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_NOMINATE'   },
-  { name: 'APPLICANT_TAGS', pk: 'TAGID',      tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APPLICANT_TAGS' },
-  { name: 'APP_SKILLS',     pk: 'SKILLID',    tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_SKILLS'     },
-  { name: 'ACTIVITY_FACT',  pk: 'ACTIVITYKEY',tsCol: 'ACTDATETIME',     hasCdcStatus: false, view: 'PROD_ANALYTICS_PRO.DATALINK.ACTIVITY_FACT'  },
+  { name: 'REQ_HIRED',       pk: 'REQHIREDID', tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.REQ_HIRED'       },
+  { name: 'APP_NOMINATE',    pk: 'NOMID',      tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_NOMINATE'    },
+  { name: 'APPLICANT_TAGS',  pk: 'TAGID',      tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APPLICANT_TAGS'  },
+  { name: 'APP_SKILLS',      pk: 'SKILLID',    tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_SKILLS'      },
+  { name: 'ACTIVITY_FACT',   pk: 'ACTIVITYKEY',tsCol: 'ACTDATETIME',     hasCdcStatus: false, view: 'PROD_ANALYTICS_PRO.DATALINK.ACTIVITY_FACT'   },
+  { name: 'APPLICANTS',      pk: 'ID',         tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APPLICANTS'      },
+  { name: 'APP_DOC_UPLOAD',  pk: 'UPID',       tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_DOC_UPLOAD'  },
+  { name: 'APP_JOB_HISTORY', pk: 'JOBHISTID',  tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_JOB_HISTORY' },
 ];
 
 async function processTable(t) {

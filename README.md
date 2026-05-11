@@ -1,6 +1,6 @@
 # lag-observer
 
-Passive observation-latency telemetry for PRO Resources' DataLink share. Tracks per-table CDC cycle interval, change-event volume, and observation latency for five high-value tables, without writing to BOLD.
+Passive observation-latency telemetry for PRO Resources' DataLink share. Tracks per-table CDC cycle interval, change-event volume, and observation latency for eight high-value tables, without writing to BOLD.
 
 ## What this measures
 
@@ -27,6 +27,9 @@ What we do NOT deliver:
 | APPLICANT_TAGS | TAGID + SEEN_PKS | (no CDCSTATUS='U' on this table) | TAGID snapshot-diff (5-min) |
 | APP_SKILLS | SKILLID + SEEN_PKS | CDCSTATUS='U' | CDCSTATUS='D' + SKILLID snapshot-diff (5-min) |
 | ACTIVITY_FACT | ACTDATETIME 24h overlap window + SEEN_PKS | (no CDCSTATUS column) | (no CDCSTATUS column) |
+| APPLICANTS | ID + SEEN_PKS | CDCSTATUS='U' | (deferred — rare, archive-not-delete pattern) |
+| APP_DOC_UPLOAD | UPID + SEEN_PKS | CDCSTATUS='U' | (deferred — CDCSTATUS='D' handling could be added if document delete volume warrants) |
+| APP_JOB_HISTORY | JOBHISTID + SEEN_PKS | CDCSTATUS='U' | (deferred — Resume Builder writebacks may produce edits/replaces that look like deletes) |
 
 ## Why polling, not Snowflake STREAMS
 

@@ -24,13 +24,24 @@ const q = (sql) => new Promise((res, rej) =>
 
 const SEEDS = [
   // [target_table, pk_column, share_view]
-  ['REQ_HIRED',       'REQHIREDID', 'PROD_ANALYTICS_PRO.DATALINK.REQ_HIRED'],
-  ['APP_NOMINATE',    'NOMID',      'PROD_ANALYTICS_PRO.DATALINK.APP_NOMINATE'],
-  ['APPLICANT_TAGS',  'TAGID',      'PROD_ANALYTICS_PRO.DATALINK.APPLICANT_TAGS'],
-  ['APP_SKILLS',      'SKILLID',    'PROD_ANALYTICS_PRO.DATALINK.APP_SKILLS'],
-  ['APPLICANTS',      'ID',         'PROD_ANALYTICS_PRO.DATALINK.APPLICANTS'],
-  ['APP_DOC_UPLOAD',  'UPID',       'PROD_ANALYTICS_PRO.DATALINK.APP_DOC_UPLOAD'],
-  ['APP_JOB_HISTORY', 'JOBHISTID',  'PROD_ANALYTICS_PRO.DATALINK.APP_JOB_HISTORY'],
+  ['REQ_HIRED',       'REQHIREDID',     'PROD_ANALYTICS_PRO.DATALINK.REQ_HIRED'],
+  ['APP_NOMINATE',    'NOMID',          'PROD_ANALYTICS_PRO.DATALINK.APP_NOMINATE'],
+  ['APPLICANT_TAGS',  'TAGID',          'PROD_ANALYTICS_PRO.DATALINK.APPLICANT_TAGS'],
+  ['APP_SKILLS',      'SKILLID',        'PROD_ANALYTICS_PRO.DATALINK.APP_SKILLS'],
+  ['APPLICANTS',      'ID',             'PROD_ANALYTICS_PRO.DATALINK.APPLICANTS'],
+  ['APP_DOC_UPLOAD',  'UPID',           'PROD_ANALYTICS_PRO.DATALINK.APP_DOC_UPLOAD'],
+  ['APP_JOB_HISTORY', 'JOBHISTID',      'PROD_ANALYTICS_PRO.DATALINK.APP_JOB_HISTORY'],
+  // v2 expansion 2026-05-14 — 9 standard-pattern tables. PKs verified 100%
+  // unique with 0 nulls against current share state via probe-new-tables.js.
+  ['APP_ANSWERS',     'APPANSWERID',    'PROD_ANALYTICS_PRO.DATALINK.APP_ANSWERS'],
+  ['REQ_SKILLS',      'REQSKILLID',     'PROD_ANALYTICS_PRO.DATALINK.REQ_SKILLS'],
+  ['REQ',             'REQID',          'PROD_ANALYTICS_PRO.DATALINK.REQ'],
+  ['REQ_NOTES',       'NOTEID',         'PROD_ANALYTICS_PRO.DATALINK.REQ_NOTES'],
+  ['COMPANY',         'COMPANYID',      'PROD_ANALYTICS_PRO.DATALINK.COMPANY'],
+  ['APP_STATUS',      'APPSTATID',      'PROD_ANALYTICS_PRO.DATALINK.APP_STATUS'],
+  ['HIRING_MANAGER',  'HIRINGMANAGERID','PROD_ANALYTICS_PRO.DATALINK.HIRING_MANAGER'],
+  ['CONT_ACTIVITY',   'CONTACTID',      'PROD_ANALYTICS_PRO.DATALINK.CONT_ACTIVITY'],
+  ['CONT_STATUS',     'CONTSTATID',     'PROD_ANALYTICS_PRO.DATALINK.CONT_STATUS'],
 ];
 
 async function main() {
@@ -65,6 +76,18 @@ async function main() {
   `);
   console.log(`inserted ${af[0]['number of rows inserted']}`);
 
+  // PLACEMENT_FACT: same fact-table pattern — last 24h on ACTDATETIME. DISTINCT
+  // because PLACEMENTACTIVITYKEY is 99.93% unique (8,844 dupes out of 12.2M).
+  process.stdout.write(`Seeding SEEN_PKS for PLACEMENT_FACT (PLACEMENTACTIVITYKEY, last 24h) ... `);
+  const pf = await q(`
+    INSERT INTO SEEN_PKS (target_table, pk_value)
+    SELECT DISTINCT 'PLACEMENT_FACT', PLACEMENTACTIVITYKEY::VARCHAR
+    FROM PROD_ANALYTICS_PRO.DATALINK.PLACEMENT_FACT
+    WHERE ACTDATETIME > DATEADD('HOUR', -24, CURRENT_TIMESTAMP())
+      AND PLACEMENTACTIVITYKEY::VARCHAR NOT IN (SELECT pk_value FROM SEEN_PKS WHERE target_table = 'PLACEMENT_FACT')
+  `);
+  console.log(`inserted ${pf[0]['number of rows inserted']}`);
+
   // Seed PK_SNAPSHOT_APPLICANT_TAGS and PK_SNAPSHOT_APP_SKILLS with current state
   process.stdout.write(`Seeding PK_SNAPSHOT_APPLICANT_TAGS ... `);
   await q(`TRUNCATE TABLE PK_SNAPSHOT_APPLICANT_TAGS`);
@@ -94,7 +117,17 @@ async function main() {
       SELECT 'ACTIVITY_FACT',                 'ACTDATETIME'     UNION ALL
       SELECT 'APPLICANTS',                    'LASTUPDATEDDATE' UNION ALL
       SELECT 'APP_DOC_UPLOAD',                'LASTUPDATEDDATE' UNION ALL
-      SELECT 'APP_JOB_HISTORY',               'LASTUPDATEDDATE'
+      SELECT 'APP_JOB_HISTORY',               'LASTUPDATEDDATE' UNION ALL
+      SELECT 'APP_ANSWERS',                   'LASTUPDATEDDATE' UNION ALL
+      SELECT 'REQ_SKILLS',                    'LASTUPDATEDDATE' UNION ALL
+      SELECT 'REQ',                           'LASTUPDATEDDATE' UNION ALL
+      SELECT 'REQ_NOTES',                     'LASTUPDATEDDATE' UNION ALL
+      SELECT 'COMPANY',                       'LASTUPDATEDDATE' UNION ALL
+      SELECT 'APP_STATUS',                    'LASTUPDATEDDATE' UNION ALL
+      SELECT 'PLACEMENT_FACT',                'ACTDATETIME'     UNION ALL
+      SELECT 'HIRING_MANAGER',                'LASTUPDATEDDATE' UNION ALL
+      SELECT 'CONT_ACTIVITY',                 'LASTUPDATEDDATE' UNION ALL
+      SELECT 'CONT_STATUS',                   'LASTUPDATEDDATE'
     ) src
     ON w.target_table = src.tt AND w.watermark_column = src.wc
     WHEN NOT MATCHED THEN INSERT (target_table, watermark_column, last_seen_at, updated_at)

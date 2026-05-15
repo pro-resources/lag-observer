@@ -1,6 +1,6 @@
 # lag-observer
 
-Passive observation-latency telemetry for PRO Resources' DataLink share. Tracks per-table CDC cycle interval, change-event volume, and observation latency for eight high-value tables, without writing to BOLD.
+Passive observation-latency telemetry for PRO Resources' DataLink share. Tracks per-table CDC cycle interval, change-event volume, and observation latency for 18 high-value tables, without writing to BOLD. The watch set is the empirical input to PRO_PG's per-table refresh-bucket classification (atomic-swap / incremental / lazy per [`pro-pg-data-context/ARCHITECTURE.md §5`](https://github.com/pro-resources/pro-pg-data-context/blob/main/ARCHITECTURE.md)).
 
 ## What this measures
 
@@ -15,10 +15,14 @@ What we deliver:
 - Hour-of-day cycle-interval pattern (catches business-hours CDC slowdowns)
 
 What we do NOT deliver:
-- Source-side BOLD commit timestamp (no column for it; verified by profiling all 28 timestamp columns across the 5 target tables)
+- Source-side BOLD commit timestamp (no column for it; verified by profiling all 28 timestamp columns across the original 5 target tables)
 - True per-row DataLink lag uncoupled from our polling interval
 
 ## Tables in scope
+
+Grouped by the wave that added them.
+
+### v0.1 + PR #1 — talent-side workflow signal
 
 | Table | Insert detection | Update detection | Delete detection |
 |---|---|---|---|
@@ -31,9 +35,24 @@ What we do NOT deliver:
 | APP_DOC_UPLOAD | UPID + SEEN_PKS | CDCSTATUS='U' | (deferred — CDCSTATUS='D' handling could be added if document delete volume warrants) |
 | APP_JOB_HISTORY | JOBHISTID + SEEN_PKS | CDCSTATUS='U' | (deferred — Resume Builder writebacks may produce edits/replaces that look like deletes) |
 
+### v2 (2026-05-14) — Resume Builder consumers + universal + customer-side
+
+| Table | Insert detection | Update detection | Delete detection | Why added |
+|---|---|---|---|---|
+| APP_ANSWERS | APPANSWERID + SEEN_PKS | CDCSTATUS='U' | (deferred) | Resume Builder reads — talent application answers |
+| REQ_SKILLS | REQSKILLID + SEEN_PKS | CDCSTATUS='U' | (deferred) | Resume Builder reads — req skill requirements |
+| REQ | REQID + SEEN_PKS | CDCSTATUS='U' | (deferred) | Resume Builder reads — req detail incl. pay rates |
+| REQ_NOTES | NOTEID + SEEN_PKS | CDCSTATUS='U' | (deferred) | Resume Builder reads — req notes (1.77M rows) |
+| COMPANY | COMPANYID + SEEN_PKS | CDCSTATUS='U' | (deferred) | Resume Builder reads — customer accounts w/ geo |
+| APP_STATUS | APPSTATID + SEEN_PKS | CDCSTATUS='U' | (deferred) | Talent-status lookup; Smart Tables `is_active_candidate` reads through it |
+| PLACEMENT_FACT | ACTDATETIME 24h overlap window + SEEN_PKS | (no CDCSTATUS column) | (no CDCSTATUS column) | 12.2M-row fact table; refresh-bucket choice is highest-cost decision in the watch set |
+| HIRING_MANAGER | HIRINGMANAGERID + SEEN_PKS | CDCSTATUS='U' | (deferred) | Customer-side contact master (Sales Pipeline Intel + Chrome ext) |
+| CONT_ACTIVITY | CONTACTID + SEEN_PKS | CDCSTATUS='U' | (deferred) | Customer-side touches (calls/emails/meetings/notes) — mirror of ACTIVITY_FACT |
+| CONT_STATUS | CONTSTATID + SEEN_PKS | CDCSTATUS='U' | (deferred) | Contact-status lookup; pairs with HIRING_MANAGER |
+
 ## Why polling, not Snowflake STREAMS
 
-Tested 2026-05-09: streams require change-tracking enabled by the share provider. Avionte hasn't enabled it on any of the 5 target views, so streams aren't available to us. We're stuck with polling. Documented for posterity in case the provider adds it later.
+Tested 2026-05-09: streams require change-tracking enabled by the share provider. Avionte hasn't enabled it on any of the original 5 target views, so streams aren't available to us. We're stuck with polling. (Not re-tested on the v2 expansion tables; if streams ever become available, that's a structural upgrade not a per-table one.)
 
 ## Why polling, not Snowflake Tasks
 
@@ -80,7 +99,7 @@ node tools/seed.js
 ### Run a single poll cycle (manual)
 
 ```bash
-node tools/poll.js                # heartbeat + insert/update/delete detection (all 5 tables)
+node tools/poll.js                # heartbeat + insert/update/delete detection (all 18 tables)
 node tools/poll.js --snapshot-diff  # silent-delete sweep on APPLICANT_TAGS + APP_SKILLS
 ```
 
@@ -129,13 +148,15 @@ SELECT * FROM RUN_HEALTH_24H;
 - **Cold-start updates** — first poll captures the snapshot of currently `CDCSTATUS='U'`-flagged rows as updates. After that, only newly-flagged rows get logged. Expected behavior; not a bug.
 - **APPLICANT_TAGS uniqueness:** `(TAGAPPLICANT, TAGTAG)` is NOT unique on this table — a single talent can have the same tag-bucket applied many times with different TAGDETAIL. Unique row identity is `TAGID`. Captured in V-CDC-02 / pro-data-architecture references.
 - **ACTIVITY_FACT watermarking** uses `ACTDATETIME` (event time, not commit time) with a 24h overlap window because `ACTIVITYKEY` and `ACTID` failed monotonicity tests (37% / 25% inversion rate respectively). Past-dated activities arriving more than 24h after their ACTDATETIME would be missed; in practice this is rare.
+- **PLACEMENT_FACT watermarking** uses the same fact-table pattern (`ACTDATETIME` + 24h overlap window, no CDCSTATUS). Its PK `PLACEMENTACTIVITYKEY` is 99.93% unique — 8,844 duplicates across 12.2M rows. Insert detection via SEEN_PKS therefore has a ~0.07% false-negative rate: if a genuinely new event happens to share a PK with a previously-observed row, we miss it. Acceptable for refresh-strategy classification, not acceptable as a primary delete-detection signal.
 
 ## Open questions for v0.2
 
 - Confirm or refute the silent-delete vs zombie-row hypothesis on APPLICANT_TAGS by comparing a known talent's tags in BOLD UI vs DataLink view (Cucumber Testpickles 199528218, Training Only branch).
+- Fix `LagObserver-SnapshotDiff` errors on APPLICANT_TAGS (371 consecutive errored runs as of 2026-05-14; APP_SKILLS snapshot-diff works fine, so the bug is APPLICANT_TAGS-specific).
 - Add row_hash for content-change detection (catches updates that don't move LASTUPDATEDDATE — currently believed to not exist on this share since LASTUPDATEDDATE is bulk-rewritten on every rebuild, but worth verifying).
 - Retention policy for CHANGE_LOG (currently unbounded). Plan: 30d detail / 90d summary / 365d daily aggregates per Codex recommendation.
-- Postgres mirror lag — once COMPAGNO_PG starts streaming the relevant tables, add observation-latency tracking on the mirror side.
+- PRO_PG snapshot freshness — track drift between the DataLink share and the `pro_test.datalink/` snapshot loaded into PRO_PG, to inform the per-table refresh-bucket choice (atomic-swap / incremental / lazy) per [`pro-pg-data-context/ARCHITECTURE.md §5`](https://github.com/pro-resources/pro-pg-data-context/blob/main/ARCHITECTURE.md). (Replaces the deprecated v0.1 plan to track COMPAGNO_PG mirror lag — Path A was abandoned 2026-05-10 in favor of PRO-direct DataLink ingest into PRO_PG.)
 
 ## Related work
 

@@ -27,21 +27,42 @@ const q = (sql) => new Promise((res, rej) =>
   conn.execute({ sqlText: sql, complete: (err, _, rows) => err ? rej(err) : res(rows || []) })
 );
 
-// Per-table config. ACTIVITY_FACT has no CDCSTATUS and uses ACTDATETIME as
-// watermark instead of LASTUPDATEDDATE.
+// Per-table config. Fact-table entries (ACTIVITY_FACT, PLACEMENT_FACT) have no
+// CDCSTATUS and use event-time (ACTDATETIME) as watermark instead of
+// LASTUPDATEDDATE. They also accept a small false-negative rate on insert
+// detection because their *_KEY PKs are not 100% unique (e.g. PLACEMENT_FACT
+// has 0.07% duplicate PLACEMENTACTIVITYKEY).
 //
-// Expansion 2026-05-11: added APPLICANTS, APP_DOC_UPLOAD, APP_JOB_HISTORY.
-// All three follow the standard CDCSTATUS + LASTUPDATEDDATE pattern.
-// PKs validated against current share state (100% unique, 0 nulls).
+// Expansion 2026-05-14 (v2): added 10 tables driving PRO_PG refresh-strategy
+// classification (Path B). Resume Builder consumers: APP_ANSWERS, REQ_SKILLS,
+// REQ, REQ_NOTES, COMPANY. Universal: APP_STATUS (status lookup),
+// PLACEMENT_FACT (12.2M-row fact table). Customer-side for Sales Pipeline Intel
+// + Chrome ext: HIRING_MANAGER, CONT_ACTIVITY, CONT_STATUS. PKs verified 100%
+// unique with 0 nulls on the 9 standard tables; PLACEMENT_FACT's PK is the
+// same-shape compromise as ACTIVITY_FACT (event-time watermarked, fat-tail
+// duplicates accepted).
 const TABLES = [
-  { name: 'REQ_HIRED',       pk: 'REQHIREDID', tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.REQ_HIRED'       },
-  { name: 'APP_NOMINATE',    pk: 'NOMID',      tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_NOMINATE'    },
-  { name: 'APPLICANT_TAGS',  pk: 'TAGID',      tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APPLICANT_TAGS'  },
-  { name: 'APP_SKILLS',      pk: 'SKILLID',    tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_SKILLS'      },
-  { name: 'ACTIVITY_FACT',   pk: 'ACTIVITYKEY',tsCol: 'ACTDATETIME',     hasCdcStatus: false, view: 'PROD_ANALYTICS_PRO.DATALINK.ACTIVITY_FACT'   },
-  { name: 'APPLICANTS',      pk: 'ID',         tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APPLICANTS'      },
-  { name: 'APP_DOC_UPLOAD',  pk: 'UPID',       tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_DOC_UPLOAD'  },
-  { name: 'APP_JOB_HISTORY', pk: 'JOBHISTID',  tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_JOB_HISTORY' },
+  { name: 'REQ_HIRED',       pk: 'REQHIREDID',          tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.REQ_HIRED'       },
+  { name: 'APP_NOMINATE',    pk: 'NOMID',               tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_NOMINATE'    },
+  { name: 'APPLICANT_TAGS',  pk: 'TAGID',               tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APPLICANT_TAGS'  },
+  { name: 'APP_SKILLS',      pk: 'SKILLID',             tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_SKILLS'      },
+  { name: 'ACTIVITY_FACT',   pk: 'ACTIVITYKEY',         tsCol: 'ACTDATETIME',     hasCdcStatus: false, view: 'PROD_ANALYTICS_PRO.DATALINK.ACTIVITY_FACT'   },
+  { name: 'APPLICANTS',      pk: 'ID',                  tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APPLICANTS'      },
+  { name: 'APP_DOC_UPLOAD',  pk: 'UPID',                tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_DOC_UPLOAD'  },
+  { name: 'APP_JOB_HISTORY', pk: 'JOBHISTID',           tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_JOB_HISTORY' },
+  // Wave 2a — Resume Builder consumers
+  { name: 'APP_ANSWERS',     pk: 'APPANSWERID',         tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_ANSWERS'     },
+  { name: 'REQ_SKILLS',      pk: 'REQSKILLID',          tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.REQ_SKILLS'      },
+  { name: 'REQ',             pk: 'REQID',               tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.REQ'             },
+  { name: 'REQ_NOTES',       pk: 'NOTEID',              tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.REQ_NOTES'       },
+  { name: 'COMPANY',         pk: 'COMPANYID',           tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.COMPANY'         },
+  // Wave 2b — universal must-have
+  { name: 'APP_STATUS',      pk: 'APPSTATID',           tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.APP_STATUS'      },
+  { name: 'PLACEMENT_FACT',  pk: 'PLACEMENTACTIVITYKEY',tsCol: 'ACTDATETIME',     hasCdcStatus: false, view: 'PROD_ANALYTICS_PRO.DATALINK.PLACEMENT_FACT'  },
+  // Wave 2c — customer-side, ahead-of-demand for Sales Pipeline Intel + Chrome ext
+  { name: 'HIRING_MANAGER',  pk: 'HIRINGMANAGERID',     tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.HIRING_MANAGER'  },
+  { name: 'CONT_ACTIVITY',   pk: 'CONTACTID',           tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.CONT_ACTIVITY'   },
+  { name: 'CONT_STATUS',     pk: 'CONTSTATID',          tsCol: 'LASTUPDATEDDATE', hasCdcStatus: true,  view: 'PROD_ANALYTICS_PRO.DATALINK.CONT_STATUS'     },
 ];
 
 async function processTable(t) {
@@ -107,10 +128,11 @@ async function processTable(t) {
     }
 
     // 4. Insert detection (PKs not in SEEN_PKS, in the recent window)
-    // For ACTIVITY_FACT, recent window = last 24h on ACTDATETIME.
-    // For others, recent window = LASTUPDATEDDATE > prior_watermark - 60s buffer.
+    // For fact tables (no CDCSTATUS, event-time watermark), recent window =
+    // last 24h on the event-time column. For others, recent window =
+    // LASTUPDATEDDATE > prior_watermark - 60s buffer.
     let recentClause;
-    if (t.name === 'ACTIVITY_FACT') {
+    if (!t.hasCdcStatus) {
       recentClause = `${t.tsCol} > DATEADD('HOUR', -24, CURRENT_TIMESTAMP())`;
     } else {
       // Use prior watermark with 60s overlap buffer to handle precision/clock skew

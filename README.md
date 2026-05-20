@@ -153,7 +153,7 @@ SELECT * FROM RUN_HEALTH_24H;
 ## Open questions for v0.2
 
 - Confirm or refute the silent-delete vs zombie-row hypothesis on APPLICANT_TAGS by comparing a known talent's tags in BOLD UI vs DataLink view (Cucumber Testpickles 199528218, Training Only branch).
-- Fix `LagObserver-SnapshotDiff` errors on APPLICANT_TAGS (371 consecutive errored runs as of 2026-05-14; APP_SKILLS snapshot-diff works fine, so the bug is APPLICANT_TAGS-specific).
+- ✅ **FIXED 2026-05-19 (PR #3):** `LagObserver-SnapshotDiff` errors on APPLICANT_TAGS (371 consecutive errored runs since 2026-05-14). Root cause: the silent-delete INSERT passed `NULL` into `CHANGE_LOG.source_lastupdateddate`, a PRIMARY KEY column Snowflake enforces NOT NULL; now uses a `'1900-01-01'` sentinel. First clean run logged 84 backlogged silent-deletes. (APP_SKILLS masked the bug by having 0 disappearances in its windows.)
 - Add row_hash for content-change detection (catches updates that don't move LASTUPDATEDDATE — currently believed to not exist on this share since LASTUPDATEDDATE is bulk-rewritten on every rebuild, but worth verifying).
 - Retention policy for CHANGE_LOG (currently unbounded). Plan: 30d detail / 90d summary / 365d daily aggregates per Codex recommendation.
 - PRO_PG snapshot freshness — track drift between the DataLink share and the `pro_test.datalink/` snapshot loaded into PRO_PG, to inform the per-table refresh-bucket choice (atomic-swap / incremental / lazy) per [`pro-pg-data-context/ARCHITECTURE.md §5`](https://github.com/pro-resources/pro-pg-data-context/blob/main/ARCHITECTURE.md). (Replaces the deprecated v0.1 plan to track COMPAGNO_PG mirror lag — Path A was abandoned 2026-05-10 in favor of PRO-direct DataLink ingest into PRO_PG.)

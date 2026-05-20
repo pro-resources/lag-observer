@@ -248,9 +248,15 @@ async function snapshotDiff() {
     let errorMsg = null;
     try {
       // Find PKs that were in the old snapshot but aren't in the share now → silent deletes
+      // source_lastupdateddate is part of CHANGE_LOG's PRIMARY KEY, which Snowflake
+      // enforces as NOT NULL. A silently-disappeared row has no source timestamp, so we
+      // use a clearly-synthetic sentinel ('1900-01-01') rather than NULL (constraint
+      // violation — the long-standing APPLICANT_TAGS snapshot_diff failure) or
+      // CURRENT_TIMESTAMP() (would masquerade as a real source update). When the
+      // disappearance was *detected* is captured by observed_at (DEFAULT CURRENT_TIMESTAMP).
       const dCount = await q(`
         INSERT INTO CHANGE_LOG (target_table, change_type, row_pk, source_lastupdateddate, cdcstatus_observed, observation_latency_sec)
-        SELECT '${t}', 'D', s.${pkCol.toLowerCase()}::VARCHAR, NULL, 'silent-disappear', NULL
+        SELECT '${t}', 'D', s.${pkCol.toLowerCase()}::VARCHAR, '1900-01-01'::TIMESTAMP_NTZ, 'silent-disappear', NULL
         FROM ${snapTable} s
         WHERE NOT EXISTS (
           SELECT 1 FROM PROD_ANALYTICS_PRO.DATALINK.${t} v WHERE v.${pkCol} = s.${pkCol.toLowerCase()}

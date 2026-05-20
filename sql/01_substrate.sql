@@ -165,6 +165,10 @@ CREATE TABLE IF NOT EXISTS PK_SNAPSHOT_APP_SKILLS (
   snapshot_at         TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
 );
 
--- Note: Snowflake doesn't enforce PRIMARY KEY / UNIQUE constraints — they're
--- metadata for query optimizer. We rely on MERGE statements in the task SQL
--- for actual dedupe semantics.
+-- Note: Snowflake doesn't enforce PRIMARY KEY / UNIQUE *uniqueness* — that part is
+-- metadata for the query optimizer, and we rely on MERGE / NOT-IN dedupe in the task
+-- SQL for actual dedupe semantics. BUT Snowflake DOES enforce NOT NULL on every
+-- PRIMARY KEY column — so source_lastupdateddate (a PK column in CHANGE_LOG) cannot be
+-- NULL. Silent-delete rows (no source timestamp) must pass a sentinel, not NULL — see
+-- tools/poll.js snapshotDiff(). (This is what caused the long-standing APPLICANT_TAGS
+-- snapshot_diff failure.)

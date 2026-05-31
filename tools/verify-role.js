@@ -42,6 +42,14 @@ async function main() {
   await q(`USE WAREHOUSE LAG_OBS_WH`);
 
   console.log('\n-- DataLink share SELECT access --');
+  // Intentional 5-table canary, NOT exhaustive. DataLink SELECT is granted
+  // database-wide via GRANT IMPORTED PRIVILEGES ON DATABASE PROD_ANALYTICS_PRO
+  // (sql/01_substrate.sql:56) — the per-view grants there are belt-and-
+  // suspenders. Access is all-or-nothing across the share, so if one view reads
+  // the role can read all 18; probing more proves nothing extra. A view dropped/
+  // renamed in the share (or typo'd in poll.js TABLES) fails as object-does-not-
+  // exist at poll time and is logged per-table in RUN_LOG — an existence check,
+  // not a role check, so it doesn't belong in this permission preflight.
   for (const t of ['REQ_HIRED', 'ACTIVITY_FACT', 'APP_NOMINATE', 'APPLICANT_TAGS', 'APP_SKILLS']) {
     await tryQ(t, `SELECT COUNT(*) AS N FROM PROD_ANALYTICS_PRO.DATALINK.${t}`);
   }

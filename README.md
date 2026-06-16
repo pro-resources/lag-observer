@@ -105,7 +105,7 @@ node tools/poll.js --snapshot-diff  # silent-delete sweep on APPLICANT_TAGS + AP
 
 ### Schedule (Windows Task Scheduler) — RETIRED 2026-06-12
 
-**The scheduled polling is retired.** Both tasks (`LagObserver-Poll`, `LagObserver-SnapshotDiff`) were disabled 2026-06-02 (last run clean, exit 0) and deleted 2026-06-12 on Brent's call. `PROD_OBSERVABILITY.LAG_OBS` is frozen at 2026-06-02 data — the 24h-windowed views return nothing newer. The nearest live freshness signal is PRO_PG-side: `ops.table_observation_log`, written by the `PRO_PG_Observer_Lag` task from `pro-pg-data-context` (different scope — it observes PRO_PG table freshness, not the DataLink share directly).
+**The scheduled polling is retired.** Both tasks (`LagObserver-Poll`, `LagObserver-SnapshotDiff`) were disabled 2026-06-02 (last run clean, exit 0) and deleted 2026-06-12 on Brent's call. `PROD_OBSERVABILITY.LAG_OBS` is frozen at 2026-06-02 data — the 24h-windowed views return nothing newer. The nearest live freshness signal is PRO_PG-side: `ops.table_observation_log`, written by the `PRO_PG_Review_DataLink_PG_Mirror_Table_Drift` task from `pro-pg-data-context` (different scope — it observes PRO_PG table freshness, not the DataLink share directly).
 
 The tooling below still works for manual one-off runs (`node tools/poll.js`), and the historical task setup is preserved in git history should the schedule ever be re-registered. Logs from the active period are in `logs/poll-YYYYMMDD.log`.
 
